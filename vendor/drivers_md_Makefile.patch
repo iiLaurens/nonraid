@@ -1,19 +1,20 @@
 --- a/drivers/md/Makefile
 +++ b/drivers/md/Makefile
-@@ -27,7 +27,11 @@
+@@ -27,9 +27,13 @@
  dm-verity-y	+= dm-verity-target.o
  dm-zoned-y	+= dm-zoned-target.o dm-zoned-metadata.o dm-zoned-reclaim.o
  
--md-mod-y	+= md.o md-bitmap.o
 +ifeq ($(CONFIG_MD_UNRAID),y)
 +md-mod-y        += md_unraid.o unraid.o
 +else
-+md-mod-y        += md.o md-bitmap.o
+ md-mod-y	+= md.o
+ md-mod-$(CONFIG_MD_BITMAP)	+= md-bitmap.o
+ md-mod-$(CONFIG_MD_LLBITMAP)	+= md-llbitmap.o
 +endif
  raid456-y	+= raid5.o raid5-cache.o raid5-ppl.o
- linear-y	+= md-linear.o
- multipath-y	+= md-multipath.o
-@@ -48,9 +52,11 @@
+ linear-y       += md-linear.o
+ 
+@@ -46,9 +50,11 @@
  obj-$(CONFIG_MD_CLUSTER)	+= md-cluster.o
  obj-$(CONFIG_BCACHE)		+= bcache/
  obj-$(CONFIG_BLK_DEV_MD)	+= md-mod.o
