@@ -2154,9 +2154,13 @@ find_partition() {
                 fi
             fi
             if [ "$dev_locked" -eq 0 ]; then
-                # If python is not available or device was not locked, return the partition
+                # If python is not available or device was not locked, return the partition and return 0
                 echo "$partition"
                 return 0
+            else
+                # If device is locked, return the partition but with a special code to indicate it's in use by another process
+                echo "$partition"
+                return 2
             fi
         fi
     fi
@@ -2261,6 +2265,11 @@ import_disks() {
         local partition=""
         if [ -n "$found_device" ]; then
             partition="$(find_partition "$found_device")"
+            local find_rc=$?
+            if [ "$find_rc" -eq 2 ]; then
+                echo -e "${YELLOW}Warning: Partition $partition on $found_device is locked by another process, skipping${NC}"
+                partition=""
+            fi
             if [ -n "$partition" ]; then
                 # Get the partition size
                 local disk_size=$(get_disk_size_kb "$partition")
@@ -2737,7 +2746,12 @@ list_available_devices() {
     # Find all disk devices
     for dev in $(lsblk -n -d -I "$include_majors" -o path 2>/dev/null); do
         # Find partition, largest on the disk and must not be mounted
-        local partition=$(find_partition "$dev")
+        local partition
+        partition=$(find_partition "$dev")
+        local find_rc=$?
+        if [ "$find_rc" -eq 2 ]; then
+            continue
+        fi
         if [ -n "$partition" ]; then
             # Get disk id
             local disk_id=""
