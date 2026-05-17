@@ -941,8 +941,9 @@ static void md_submit_bio(struct bio *bi)
         }
         
         bi = bio_split_to_limits(bi);
+        if (!bi)
+                return;
         bi->bi_opf &= ~REQ_NOMERGE;
-
         unraid_make_request(mddev, unit, bi);
 }
 
