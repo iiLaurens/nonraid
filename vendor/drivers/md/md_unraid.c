@@ -944,6 +944,7 @@ static void md_submit_bio(struct bio *bi)
         if (!bi)
                 return;
         bi->bi_opf &= ~REQ_NOMERGE;
+
         unraid_make_request(mddev, unit, bi);
 }
 
@@ -991,7 +992,7 @@ static struct queue_limits *md_set_queue_limits(struct queue_limits *lim, mdk_rd
         /* set default stacking limits */
         blk_set_stacking_limits(lim);
         lim->features = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA | BLK_FEAT_IO_STAT | BLK_FEAT_NOWAIT;
-
+        
         /* merge lower device limits */
         if (!strstr(rdev->status, "DISK_NP")) {
                 queue_limits_stack_bdev(lim, rdev->bdev, rdev->offset, rdev->name);
@@ -1000,6 +1001,7 @@ static struct queue_limits *md_set_queue_limits(struct queue_limits *lim, mdk_rd
         /* we must override selected merged limits */
         lim->logical_block_size = 512;
         lim->physical_block_size = 4096;
+        lim->dma_alignment = 511;
         lim->io_min = 512;
         lim->io_opt = 128 * 1024;
         lim->max_hw_wzeroes_unmap_sectors = 0;
@@ -1047,8 +1049,9 @@ static int do_run(mddev_t *mddev)
                 struct queue_limits lim;
 
 		if (disk_active(disk) || disk_enabled(disk)) {
-			int unit = disk->number;
 			struct gendisk *gd = blk_alloc_disk(NULL,NUMA_NO_NODE);
+                        mdk_rdev_t *rdev = &mddev->rdev[i];
+			int unit = disk->number;
                         int ret;
 
 			mddev->gendisk[unit] = gd;
@@ -1060,7 +1063,7 @@ static int do_run(mddev_t *mddev)
 			gd->fops = &md_fops;
 			gd->private_data = mddev;
 			gd->queue->queuedata = mddev;
-                        queue_limits_set(gd->queue, md_set_queue_limits(&lim, mddev->rdev));
+                        queue_limits_set(gd->queue, md_set_queue_limits(&lim, rdev));
 
                         /* capacity in 512-byte sectors */
                         set_capacity(gd, disk->size*2);
