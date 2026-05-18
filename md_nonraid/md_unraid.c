@@ -1004,7 +1004,9 @@ static struct queue_limits *md_set_queue_limits(struct queue_limits *lim, mdk_rd
         lim->dma_alignment = 511;
         lim->io_min = 512;
         lim->io_opt = 128 * 1024;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
         lim->max_hw_wzeroes_unmap_sectors = 0;
+#endif
         lim->max_secure_erase_sectors = 0; /* disable secure_erase */
         lim->max_write_zeroes_sectors = 0; /* disable write_zeroes */
         lim->max_hw_sectors = 256;  /* 256 sectors => 128K */
