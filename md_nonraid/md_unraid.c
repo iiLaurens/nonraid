@@ -998,6 +998,11 @@ static struct queue_limits *md_set_queue_limits(struct queue_limits *lim, mdk_rd
                 queue_limits_stack_bdev(lim, rdev->bdev, rdev->offset, rdev->name);
         }
 
+        /* disk being emulated, set some missing defaults */
+        if (strstr(rdev->status, "DISK_NP")) {
+                lim->max_zone_append_sectors = 0;
+        }
+
         /* we must override selected merged limits */
         lim->logical_block_size = 512;
         lim->physical_block_size = 4096;
