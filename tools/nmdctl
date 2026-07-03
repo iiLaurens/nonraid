@@ -2117,9 +2117,11 @@ get_fs_usage() {
     return 0
 }
 
-# Get disk size in 1K blocks
+# Get disk size in 1K blocks, optionally subtracting an offset (in 512-byte sectors)
+# Usage: get_disk_size_kb <device> [offset_sectors]
 get_disk_size_kb() {
     local device="$1"
+    local offset_sectors="${2:-0}"
     if [ ! -b "$device" ]; then
         return 1
     fi
@@ -2127,6 +2129,10 @@ get_disk_size_kb() {
     # Use blockdev to get exact size in 512-byte logical sectors
     local sectors=$(blockdev --getsz "$device" 2>/dev/null)
     if [ -n "$sectors" ]; then
+        # Subtract offset if provided
+        if [ "$offset_sectors" -gt 0 ]; then
+            sectors=$(( sectors - offset_sectors ))
+        fi
         # Round down to nearest multiple of 8 sectors (driver reads/writes 8 sectors at a time)
         local adjusted_sectors=$(( (sectors / 8) * 8 ))
         # Convert to 1K blocks (2 sectors = 1KB)
@@ -2135,6 +2141,36 @@ get_disk_size_kb() {
         return 0
     fi
     return 1
+}
+
+# Get partition start sector for a block device (in 512-byte sectors)
+# For a whole-disk device (e.g. /dev/loop0), returns the start sector of the first partition
+# For a partition device (e.g. /dev/loop0p1), returns 0 (kernel handles the offset)
+get_partition_start_sector() {
+    local device="$1"
+    if [ ! -b "$device" ]; then
+        echo "0"
+        return 0
+    fi
+
+    # Check if this device is a partition (has a parent device)
+    # lsblk -no START returns the start sector for partitions, empty for whole disks
+    local start=$(lsblk -no START "$device" 2>/dev/null | head -1)
+    if [ -n "$start" ] && [ "$start" -gt 0 ]; then
+        # This is a partition - kernel handles offset, so return 0
+        echo "0"
+        return 0
+    fi
+
+    # This is a whole disk - find its first partition's start sector
+    local first_partition=$(lsblk -lpno KNAME,START "$device" 2>/dev/null | grep -v "^$device " | awk '{print $1, $2}' | head -1)
+    if [ -n "$first_partition" ]; then
+        local part_start=$(echo "$first_partition" | awk '{print $2}')
+        echo "${part_start:-0}"
+    else
+        echo "0"
+    fi
+    return 0
 }
 
 # Find an unused largest partition for a given disk device
@@ -2876,14 +2912,27 @@ create_array_layout() {
         slot_spec="${param%%:*}"
         local rest="${param#*:}"
 
-        # Now parse the device path and optional ID from rest
-        if [[ "$rest" =~ ^([^:]+):(.+)$ ]]; then
-            # device:ID
-            device_path="${BASH_REMATCH[1]}"
-            provided_disk_id="${BASH_REMATCH[2]}"
-        else
-            # just device
-            device_path="$rest"
+        # Now parse the device path, optional ID, and optional offset from rest
+        # Format: SLOT:DEV[:ID[:OFFSET]]
+        local provided_disk_id=""
+        local provided_offset=0
+
+        # Parse colon-separated fields
+        local -a fields
+        IFS=':' read -ra fields <<< "$rest"
+
+        device_path="${fields[0]}"
+        if [ ${#fields[@]} -ge 2 ]; then
+            # If the second field looks like a number (no non-digit chars and starts with digit), it could be offset
+            # Otherwise treat it as disk ID
+            if [[ "${fields[1]}" =~ ^[0-9]+$ ]]; then
+                provided_offset="${fields[1]}"
+            else
+                provided_disk_id="${fields[1]}"
+                if [ ${#fields[@]} -ge 3 ]; then
+                    provided_offset="${fields[2]}"
+                fi
+            fi
         fi
 
         # Validate device path is not empty
@@ -2945,16 +2994,16 @@ create_array_layout() {
             return 1
         fi
 
-        # Get disk size
-        local size_kb=$(get_disk_size_kb "$device_path")
+        # Get disk size (subtract offset from total size to get usable data region)
+        local size_kb=$(get_disk_size_kb "$device_path" "$provided_offset")
         if [ -z "$size_kb" ] || [ "$size_kb" -le 0 ]; then
             echo -e "${RED}Error: Could not determine size for $device_path${NC}"
             return 1
         fi
 
-        echo -e "Slot ${BLUE}$slot${NC}: ${BLUE}$(basename "$device_path")${NC} ($(format_kbytes "$size_kb" 0 0 "gb") GB) ID: $disk_id"
+        echo -e "Slot ${BLUE}$slot${NC}: ${BLUE}$(basename "$device_path")${NC} ($(format_kbytes "$size_kb" 0 0 "gb") GB) ID: $disk_id"$([ "$provided_offset" -gt 0 ] && echo -e " Offset: ${BLUE}$provided_offset${NC}")
 
-        import_entries+=("$slot|$device_path|$size_kb|$disk_id")
+        import_entries+=("$slot|$device_path|$size_kb|$provided_offset|$disk_id")
         assigned_slots+=("$slot")
     done
 
@@ -2973,11 +3022,11 @@ create_array_layout() {
 
     local import_failed=0
     for entry in "${sorted_entries[@]}"; do
-        IFS='|' read -r slot device_path size_kb disk_id <<< "$entry"
+        IFS='|' read -r slot device_path size_kb offset disk_id <<< "$entry"
 
         echo -e "Importing disk to slot $slot: ${BLUE}$(basename "$device_path")${NC}"
 
-        if ! run_nmd_command "import $slot $(basename "$device_path") 0 $size_kb 0 $disk_id"; then
+        if ! run_nmd_command "import $slot $(basename "$device_path") $offset $size_kb 0 $disk_id"; then
             echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
             import_failed=1
         else
@@ -3349,14 +3398,15 @@ add_disk() {
         esac
     done
 
-    # Parse parameter if provided in SLOT:DEVICE[:ID] format
+    # Parse parameter if provided in SLOT:DEVICE[:ID[:OFFSET]] format
     local param_slot=""
     local param_device=""
     local param_disk_id=""
+    local param_offset=0
     local use_param_mode=0
 
     if [ -n "$disk_param" ] && [[ "$disk_param" =~ : ]]; then
-        # Check if it matches SLOT:DEVICE[:ID] format
+        # Check if it matches SLOT:DEVICE[:...] format
         if [[ "$disk_param" =~ ^([0-9P-Q]|[12][0-9]|29):(.+)$ ]]; then
             use_param_mode=1
 
@@ -3364,14 +3414,21 @@ add_disk() {
             param_slot="${disk_param%%:*}"
             local rest="${disk_param#*:}"
 
-            # Parse device path and optional ID from rest
-            if [[ "$rest" =~ ^([^:]+):(.+)$ ]]; then
-                # device:ID format
-                param_device="${BASH_REMATCH[1]}"
-                param_disk_id="${BASH_REMATCH[2]}"
-            else
-                # just device
-                param_device="$rest"
+            # Parse colon-separated fields: DEVICE[:ID[:OFFSET]]
+            local -a fields
+            IFS=':' read -ra fields <<< "$rest"
+
+            param_device="${fields[0]}"
+            if [ ${#fields[@]} -ge 2 ]; then
+                # If the second field is numeric, treat as offset
+                if [[ "${fields[1]}" =~ ^[0-9]+$ ]]; then
+                    param_offset="${fields[1]}"
+                else
+                    param_disk_id="${fields[1]}"
+                    if [ ${#fields[@]} -ge 3 ]; then
+                        param_offset="${fields[2]}"
+                    fi
+                fi
             fi
 
             # Convert P/Q notation to slot numbers
@@ -3663,6 +3720,7 @@ add_disk() {
     local selected_size_kb=0
     local selected_size_gb=0
     local selected_disk_id=""
+    local selected_offset=0
 
     if [ "$use_param_mode" -eq 1 ]; then
         # Parameter mode: validate and use the provided device
@@ -3690,7 +3748,7 @@ add_disk() {
         # Set selected device info
         selected_partition="$param_device"
         selected_dev="$parent_dev"
-        selected_size_kb=$(get_disk_size_kb "$param_device")
+        selected_size_kb=$(get_disk_size_kb "$param_device" "$param_offset")
 
         if [ -z "$selected_size_kb" ] || [ "$selected_size_kb" -le 0 ]; then
             echo -e "${RED}Error: Could not determine size for $param_device${NC}"
@@ -3698,6 +3756,7 @@ add_disk() {
         fi
 
         selected_size_gb=$(format_kbytes "$selected_size_kb" 0 0 "gb")
+        selected_offset="$param_offset"
 
         # Get or use provided disk ID
         if [ -n "$param_disk_id" ]; then
@@ -3733,6 +3792,7 @@ add_disk() {
         echo -e "Partition: $(basename "$selected_partition")"
         echo -e "Size: $selected_size_gb GB"
         echo -e "ID: $selected_disk_id"
+        [ "$selected_offset" -gt 0 ] && echo -e "Offset: ${BLUE}$selected_offset${NC} sectors"
         echo ""
     else
         # Interactive mode: display menu and let user select
@@ -3877,7 +3937,7 @@ add_disk() {
     echo -e "Adding disk to array..."
 
     # Import disk: slot, partition, offset, size, erased, id
-    if ! run_nmd_command "import $selected_slot $(basename "$selected_partition") 0 $selected_size_kb $preclear_done $selected_disk_id"; then
+    if ! run_nmd_command "import $selected_slot $(basename "$selected_partition") $selected_offset $selected_size_kb $preclear_done $selected_disk_id"; then
         echo -e "${RED}Error: Failed to add disk to slot $selected_slot${NC}"
         return 1
     fi
